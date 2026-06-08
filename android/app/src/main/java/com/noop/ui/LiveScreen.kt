@@ -4,17 +4,24 @@ import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Bluetooth
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.ExpandLess
+import androidx.compose.material.icons.filled.ExpandMore
 import androidx.compose.material.icons.filled.GraphicEq
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -25,6 +32,9 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
@@ -51,6 +61,7 @@ fun LiveScreen(viewModel: AppViewModel) {
     val live by viewModel.live.collectAsStateWithLifecycle()
     val bpm by viewModel.bpm.collectAsStateWithLifecycle()
     val selectedModel by viewModel.selectedModel.collectAsStateWithLifecycle()
+    val strapLog by viewModel.strapLog.collectAsStateWithLifecycle()
     val context = LocalContext.current
 
     // The runtime Bluetooth permission gates scanning. If it isn't granted, the Connect
@@ -185,6 +196,11 @@ fun LiveScreen(viewModel: AppViewModel) {
         if (!live.bonded) {
             ConnectionHelp(viewModel, modifier = Modifier.fillMaxWidth())
         }
+
+        // Strap log — collapsible, monospace, auto-scrolls to bottom on new entries.
+        // Tap the header to expand. Mirrors the Mac app's STRAP LOG card and is the
+        // user-visible counterpart to `adb logcat -s WhoopBleClient` when debugging.
+        StrapLogCard(lines = strapLog, modifier = Modifier.fillMaxWidth())
     }
 }
 
@@ -230,4 +246,75 @@ private fun batteryColor(pct: Double?): Color = when {
     pct < 15 -> Palette.statusCritical
     pct < 30 -> Palette.statusWarning
     else -> Palette.accent
+}
+
+/**
+ * Strap log card — a collapsible window onto [WhoopBleClient.logLines]. Mirrors the
+ * Mac app's STRAP LOG section (Strand/Screens/LiveView.swift `logCard`). Collapsed by
+ * default so it doesn't dominate the screen; tap the header to expand. When expanded,
+ * lines render in a fixed-height scroll region and auto-scroll to the newest entry
+ * whenever the line count grows.
+ */
+@Composable
+private fun StrapLogCard(lines: List<String>, modifier: Modifier = Modifier) {
+    var expanded by remember { mutableStateOf(false) }
+    val shape = RoundedCornerShape(Metrics.cardRadius)
+    Column(
+        modifier = modifier
+            .background(Palette.surfaceRaised, shape)
+            .border(1.dp, Palette.hairline, shape),
+    ) {
+        // Header: tap-to-toggle. Shows line count so the user knows the buffer is alive
+        // even when collapsed.
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clickable { expanded = !expanded }
+                .padding(horizontal = 14.dp, vertical = 12.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween,
+        ) {
+            Overline("Strap log (${lines.size})")
+            Icon(
+                imageVector = if (expanded) Icons.Filled.ExpandLess else Icons.Filled.ExpandMore,
+                contentDescription = if (expanded) "Collapse log" else "Expand log",
+                tint = Palette.textSecondary,
+                modifier = Modifier.size(20.dp),
+            )
+        }
+
+        if (expanded) {
+            val scrollState = rememberScrollState()
+            // Auto-scroll to the bottom whenever new lines arrive. Keyed on lines.size
+            // (rather than the list itself) so we re-scroll on appends but don't run
+            // every recomposition.
+            LaunchedEffect(lines.size) {
+                scrollState.animateScrollTo(scrollState.maxValue)
+            }
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(220.dp)
+                    .verticalScroll(scrollState)
+                    .padding(horizontal = 14.dp, vertical = 8.dp),
+            ) {
+                if (lines.isEmpty()) {
+                    Text(
+                        "No log entries yet. Tap Connect to start a session.",
+                        style = NoopType.footnote,
+                        color = Palette.textTertiary,
+                    )
+                } else {
+                    for (line in lines) {
+                        Text(
+                            text = line,
+                            style = NoopType.mono(11f),
+                            color = Palette.textSecondary,
+                            modifier = Modifier.fillMaxWidth(),
+                        )
+                    }
+                }
+            }
+        }
+    }
 }

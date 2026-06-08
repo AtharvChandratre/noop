@@ -51,6 +51,9 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     /** Live connection + biometric snapshot, surfaced straight from the BLE client. */
     val live: StateFlow<LiveState> = ble.state
 
+    /** Rolling strap log (most recent ~300 lines). Drives the Live screen log card. */
+    val strapLog: StateFlow<List<String>> = ble.logLines
+
     /** Which strap the user is pairing — drives the scan filter in [connect]. Defaults to WHOOP 4.0. */
     private val _selectedModel = MutableStateFlow(WhoopModel.WHOOP4)
     val selectedModel: StateFlow<WhoopModel> = _selectedModel.asStateFlow()

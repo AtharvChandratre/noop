@@ -39,6 +39,7 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import java.util.UUID
 import java.util.concurrent.ConcurrentLinkedQueue
@@ -136,6 +137,9 @@ class WhoopBleClient(
 
     companion object {
         private const val TAG = "WhoopBleClient"
+        // Strap log ring-buffer cap (mirrors Swift LiveState's 200; bumped to keep more
+        // post-bond detail when the user expands the Live screen log card).
+        private const val LOG_MAX_LINES = 300
 
         // MARK: GATT UUIDs (authoritative, from BLEManager.swift / FINDINGS.md).
         //
@@ -223,6 +227,15 @@ class WhoopBleClient(
     // MARK: Published state — the single source of truth the UI observes.
     private val _state = MutableStateFlow(LiveState())
     val state: StateFlow<LiveState> = _state.asStateFlow()
+
+    // MARK: In-memory strap log (port of Strand LiveState.log).
+    // Lives on its own StateFlow rather than inside [LiveState] so log appends don't churn
+    // the live snapshot — every HR / battery / event re-emission would otherwise rebuild the
+    // log list and re-trigger every collector. Ring-buffered at LOG_MAX_LINES so memory stays
+    // bounded across long sessions. The Live screen renders it as a collapsible card.
+    private val _logLines = MutableStateFlow<List<String>>(emptyList())
+    val logLines: StateFlow<List<String>> = _logLines.asStateFlow()
+    private val logTimeFormatter = java.text.SimpleDateFormat("HH:mm:ss.SSS", java.util.Locale.US)
 
     // MARK: Android Bluetooth handles.
     private val bluetoothManager: BluetoothManager? =
@@ -1396,5 +1409,16 @@ class WhoopBleClient(
 
     private fun log(s: String) {
         Log.d(TAG, s)
+        val line = "[${logTimeFormatter.format(java.util.Date())}] $s"
+        // Append to the ring buffer; trim the oldest entries when over LOG_MAX_LINES so
+        // memory stays bounded across long sessions. update {} is atomic on MutableStateFlow,
+        // so multiple GATT-callback threads can log concurrently without losing entries.
+        _logLines.update { prev ->
+            if (prev.size >= LOG_MAX_LINES) {
+                prev.drop(prev.size - LOG_MAX_LINES + 1) + line
+            } else {
+                prev + line
+            }
+        }
     }
 }
