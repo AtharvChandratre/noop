@@ -39,6 +39,7 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import java.util.UUID
 import java.util.concurrent.ConcurrentLinkedQueue
@@ -136,6 +137,9 @@ class WhoopBleClient(
 
     companion object {
         private const val TAG = "WhoopBleClient"
+        // Strap log ring-buffer cap (mirrors Swift LiveState's 200; bumped to keep more
+        // post-bond detail when the user expands the Live screen log card).
+        private const val LOG_MAX_LINES = 300
 
         // MARK: GATT UUIDs (authoritative, from BLEManager.swift / FINDINGS.md).
         //
@@ -223,6 +227,15 @@ class WhoopBleClient(
     // MARK: Published state — the single source of truth the UI observes.
     private val _state = MutableStateFlow(LiveState())
     val state: StateFlow<LiveState> = _state.asStateFlow()
+
+    // MARK: In-memory strap log (port of Strand LiveState.log).
+    // Lives on its own StateFlow rather than inside [LiveState] so log appends don't churn
+    // the live snapshot — every HR / battery / event re-emission would otherwise rebuild the
+    // log list and re-trigger every collector. Ring-buffered at LOG_MAX_LINES so memory stays
+    // bounded across long sessions. The Live screen renders it as a collapsible card.
+    private val _logLines = MutableStateFlow<List<String>>(emptyList())
+    val logLines: StateFlow<List<String>> = _logLines.asStateFlow()
+    private val logTimeFormatter = java.text.SimpleDateFormat("HH:mm:ss.SSS", java.util.Locale.US)
 
     // MARK: Android Bluetooth handles.
     private val bluetoothManager: BluetoothManager? =
@@ -341,11 +354,23 @@ class WhoopBleClient(
      */
     private data class PendingWrite(val frame: ByteArray, val withResponse: Boolean)
     private val writeQueue = ConcurrentLinkedQueue<PendingWrite>()
+    @Volatile
     private var writeInFlight = false
 
     /** Descriptor-write queue: enabling notifications is also a one-at-a-time GATT operation. */
     private val cccdQueue = ConcurrentLinkedQueue<BluetoothGattCharacteristic>()
+    @Volatile
     private var cccdInFlight = false
+
+    /**
+     * One-shot guard: the FIRST safe moment to start draining CCCDs is after the bond /
+     * CLIENT_HELLO write has settled. Held back from [onServicesDiscovered] because Android's
+     * GATT stack allows ONE op in flight across writeCharacteristic + writeDescriptor — a
+     * writeDescriptor issued while the bond write is in flight is rejected with BUSY, the queue
+     * cascades through every CCCD un-subscribed, and the UI sits at "Bonded — streaming" with
+     * no HR / battery / events forever (issue #12).
+     */
+    private var cccdDrainKicked = false
 
     // ====================================================================================
     // MARK: Public API  (port of BLEManager.connect / disconnect / send + buzz helper)
@@ -558,12 +583,18 @@ class WhoopBleClient(
             // 1. Custom service: capture the cmd-write char, FIRE THE BOND, queue the notify subs.
             val whoop4 = g.getService(WHOOP4_SERVICE)
             val whoop5 = g.getService(WHOOP5_SERVICE)
+            // True once a bond / CLIENT_HELLO write has been fired, so the post-discovery
+            // fallback below skips the immediate CCCD drain (those writes own the kick).
+            var commandWriteFired = false
             if (whoop4 != null) {
                 // Verified WHOOP 4.0 path (unchanged): capture the cmd-write char, FIRE THE BOND
                 // (one CONFIRMED GET_BATTERY_LEVEL write triggers just-works bonding), queue notify subs.
                 connectedFamily = DeviceFamily.WHOOP4
                 cmdCharacteristic = whoop4.getCharacteristic(CMD_WRITE_CHAR)
-                cmdCharacteristic?.let { writeBondFrame(g, it) }
+                cmdCharacteristic?.let {
+                    writeBondFrame(g, it)
+                    commandWriteFired = true
+                }
                 whoop4.getCharacteristic(CMD_NOTIFY_CHAR)?.let { cccdQueue.add(it) }
                 whoop4.getCharacteristic(EVENT_NOTIFY_CHAR)?.let { cccdQueue.add(it) }
                 whoop4.getCharacteristic(DATA_NOTIFY_CHAR)?.let { cccdQueue.add(it) }
@@ -582,7 +613,10 @@ class WhoopBleClient(
                         "battery may appear but deeper metrics won't. WHOOP 4.0 is fully supported today.",
                 )
                 cmdCharacteristic = whoop5.getCharacteristic(WHOOP5_CMD_WRITE_CHAR)
-                cmdCharacteristic?.let { writeClientHello(g, it) }
+                cmdCharacteristic?.let {
+                    writeClientHello(g, it)
+                    commandWriteFired = true
+                }
             } else {
                 log("Custom WHOOP service not found on this peripheral")
             }
@@ -593,8 +627,17 @@ class WhoopBleClient(
             // 3. Standard battery profile (plain %).
             g.getService(BATTERY_SERVICE)?.getCharacteristic(BATTERY_CHAR)?.let { cccdQueue.add(it) }
 
-            // Drain the descriptor queue (enables notifications one at a time).
-            drainCccdQueue(g)
+            // CCCD drain is DEFERRED when a bond / CLIENT_HELLO write was just fired — those
+            // paths own the kick (WHOOP4 from onCharacteristicWrite when the bond ACKs; WHOOP5
+            // from writeClientHello via handler.post). Without that defer, the writeDescriptor
+            // races the in-flight characteristic write and Android's GATT stack rejects every
+            // CCCD with BUSY — the symptom is the "Bonded — streaming" pill with no HR /
+            // battery / events / wrist state (issue #12). The no-command-service branch falls
+            // through and drains immediately so the standard HR + battery profile still work.
+            if (!commandWriteFired && !cccdDrainKicked) {
+                cccdDrainKicked = true
+                drainCccdQueue(g)
+            }
         }
 
         override fun onCharacteristicWrite(
@@ -611,18 +654,22 @@ class WhoopBleClient(
                 log("BONDED (confirmed write acknowledged) — custom channels should now flow")
             }
 
-            // Run the connect handshake EXACTLY ONCE per connection. didWriteValueFor / onCharacteristicWrite
-            // re-fires on EVERY with-response write (the bond write, etc.); the guard prevents re-blasting
-            // the handshake at the strap mid-session — THE iOS "won't serve" root cause from the Swift notes.
-            // WHOOP 5.0/MG uses CLIENT_HELLO, not this WHOOP4 command sequence, so it is skipped for it.
-            if (!connectHandshakeDone && connectedFamily == DeviceFamily.WHOOP4) {
-                connectHandshakeDone = true
-                runConnectHandshake()
+            // The bond write held the GATT stack busy. Now it's settled (success OR failure),
+            // so it's safe to start draining CCCDs without racing a writeDescriptor (issue #12).
+            // The connect handshake fires from drainCccdQueue's queue-empty branch — its WHOOP4
+            // commands would otherwise race the in-flight writeDescriptors the same way. Even
+            // on bond failure we still subscribe to the standard HR/battery profile, which works
+            // unbonded.
+            if (!cccdDrainKicked) {
+                cccdDrainKicked = true
+                drainCccdQueue(g)
             }
 
-            // This with-response write is done; release the in-flight slot and send the next.
+            // This with-response write is done; release the in-flight slot and kick BOTH
+            // queues — a CCCD drain that was waiting on this write needs to resume too.
             writeInFlight = false
             drainWriteQueue()
+            drainCccdQueue(g)
         }
 
         override fun onDescriptorWrite(
@@ -635,9 +682,12 @@ class WhoopBleClient(
             } else {
                 log("Subscribed ${descriptor.characteristic?.uuid}")
             }
-            // This CCCD write is done; enable the next characteristic's notifications.
+            // This CCCD write is done; release the in-flight slot and kick BOTH queues — any
+            // writeCharacteristic that was waiting on this descriptor write needs to resume
+            // (e.g. TOGGLE_REALTIME_HR queued the moment bonded=true flipped).
             cccdInFlight = false
             drainCccdQueue(g)
+            drainWriteQueue()
         }
 
         // Android 13+ delivers the value as a parameter; older APIs read it off the characteristic.
@@ -826,6 +876,19 @@ class WhoopBleClient(
     // ====================================================================================
 
     /**
+     * Fire the WHOOP4 connect handshake exactly once per connection, AFTER the CCCD drain has
+     * finished — so the handshake's commands don't race a pending writeDescriptor (issue #12).
+     * WHOOP 5/MG has no equivalent handshake; this is a no-op there.
+     */
+    private fun maybeRunConnectHandshake() {
+        if (connectHandshakeDone) return
+        if (connectedFamily != DeviceFamily.WHOOP4) return
+        if (!didBond) return
+        connectHandshakeDone = true
+        runConnectHandshake()
+    }
+
+    /**
      * WHOOP-faithful connect lifecycle, run EXACTLY ONCE per connection after the bond ACK.
      * Port of the post-bond block in `BLEManager.didWriteValueFor`:
      *   hello → set RTC → stop the type-43 realtime flood → refresh data range.
@@ -878,7 +941,14 @@ class WhoopBleClient(
 
     @SuppressLint("MissingPermission")
     private fun drainWriteQueue() {
-        if (writeInFlight) return
+        // Android serialises ALL GATT ops, not just writeCharacteristic. If a CCCD descriptor
+        // write is in flight (e.g. the post-bond drain is still running), firing a
+        // writeCharacteristic now is rejected with BUSY and the existing failure path silently
+        // drops the frame. Symptom: TOGGLE_REALTIME_HR queued by LiveScreen the instant
+        // bonded=true flips never reaches the strap, so the HR card stays at "—" while battery
+        // (delivered by the bond's own COMMAND_RESPONSE) and unsolicited EVENTs both populate.
+        // (Second half of issue #12; the cccdInFlight check waits out the drain.)
+        if (writeInFlight || cccdInFlight) return
         val g = gatt ?: return
         val ch = cmdCharacteristic ?: return
         val item = writeQueue.poll() ?: return
@@ -903,10 +973,12 @@ class WhoopBleClient(
 
         if (!ok) {
             // The stack rejected the write outright (no callback will come) — release the slot and
-            // keep draining so one bad write doesn't wedge the queue.
+            // keep draining so one bad write doesn't wedge the queue. Kick the CCCD queue too in
+            // case a descriptor write was waiting on this slot.
             writeInFlight = false
             log("writeCharacteristic rejected by stack; dropping one frame")
             drainWriteQueue()
+            drainCccdQueue(g)
             return
         }
 
@@ -916,6 +988,7 @@ class WhoopBleClient(
             handler.post {
                 writeInFlight = false
                 drainWriteQueue()
+                drainCccdQueue(g)
             }
         }
     }
@@ -979,6 +1052,16 @@ class WhoopBleClient(
         if (connectedFamily == DeviceFamily.WHOOP5 && puffinExperiment.isEnabled) {
             writePuffinRealtimeHrProbe(g, ch)
         }
+
+        // NO_RESPONSE writes don't fire onCharacteristicWrite, so there's no natural trigger to
+        // kick the CCCD drain. Hop the main looper once so the local GATT stack finishes
+        // dispatching the hello (+ optional puffin probe) before the first writeDescriptor goes
+        // out — otherwise the descriptor write races them and Android rejects it with BUSY,
+        // leaving the UI on "Bonded — streaming" with no live data (issue #12).
+        if (!cccdDrainKicked) {
+            cccdDrainKicked = true
+            handler.post { drainCccdQueue(g) }
+        }
     }
 
     /**
@@ -1012,8 +1095,18 @@ class WhoopBleClient(
 
     @SuppressLint("MissingPermission")
     private fun drainCccdQueue(g: BluetoothGatt) {
-        if (cccdInFlight) return
-        val ch = cccdQueue.poll() ?: return
+        // Symmetric to drainWriteQueue: a writeDescriptor issued during an in-flight
+        // writeCharacteristic is rejected with BUSY. Wait for the characteristic write to
+        // complete; onCharacteristicWrite re-kicks this drain after releasing the slot.
+        if (cccdInFlight || writeInFlight) return
+        val ch = cccdQueue.poll()
+        if (ch == null) {
+            // CCCDs done — now safe to run the WHOOP4 connect handshake without its commands
+            // racing a pending writeDescriptor. Idempotent: re-entry with an empty queue is a
+            // no-op once connectHandshakeDone flips.
+            maybeRunConnectHandshake()
+            return
+        }
         cccdInFlight = true
 
         // Tell the local stack to surface notifications, then write the CCCD so the remote starts
@@ -1024,6 +1117,7 @@ class WhoopBleClient(
             log("No CCCD on ${ch.uuid}; skipping")
             cccdInFlight = false
             drainCccdQueue(g)
+            drainWriteQueue()
             return
         }
         val enableValue = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
@@ -1040,6 +1134,7 @@ class WhoopBleClient(
             cccdInFlight = false
             log("writeDescriptor rejected for ${ch.uuid}")
             drainCccdQueue(g)
+            drainWriteQueue()
         }
     }
 
@@ -1271,6 +1366,7 @@ class WhoopBleClient(
         cccdQueue.clear()
         writeInFlight = false
         cccdInFlight = false
+        cccdDrainKicked = false
 
         // Reset offload state so the next connect starts a fresh session (port of the backfill
         // flag resets in didDisconnectPeripheral). Timers are handler-posted, so cancel them here.
@@ -1313,5 +1409,16 @@ class WhoopBleClient(
 
     private fun log(s: String) {
         Log.d(TAG, s)
+        val line = "[${logTimeFormatter.format(java.util.Date())}] $s"
+        // Append to the ring buffer; trim the oldest entries when over LOG_MAX_LINES so
+        // memory stays bounded across long sessions. update {} is atomic on MutableStateFlow,
+        // so multiple GATT-callback threads can log concurrently without losing entries.
+        _logLines.update { prev ->
+            if (prev.size >= LOG_MAX_LINES) {
+                prev.drop(prev.size - LOG_MAX_LINES + 1) + line
+            } else {
+                prev + line
+            }
+        }
     }
 }
