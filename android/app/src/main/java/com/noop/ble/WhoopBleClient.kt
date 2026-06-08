@@ -341,6 +341,7 @@ class WhoopBleClient(
      */
     private data class PendingWrite(val frame: ByteArray, val withResponse: Boolean)
     private val writeQueue = ConcurrentLinkedQueue<PendingWrite>()
+    @Volatile
     private var writeInFlight = false
 
     /** Descriptor-write queue: enabling notifications is also a one-at-a-time GATT operation. */
@@ -651,9 +652,11 @@ class WhoopBleClient(
                 drainCccdQueue(g)
             }
 
-            // This with-response write is done; release the in-flight slot and send the next.
+            // This with-response write is done; release the in-flight slot and kick BOTH
+            // queues — a CCCD drain that was waiting on this write needs to resume too.
             writeInFlight = false
             drainWriteQueue()
+            drainCccdQueue(g)
         }
 
         override fun onDescriptorWrite(
@@ -666,9 +669,12 @@ class WhoopBleClient(
             } else {
                 log("Subscribed ${descriptor.characteristic?.uuid}")
             }
-            // This CCCD write is done; enable the next characteristic's notifications.
+            // This CCCD write is done; release the in-flight slot and kick BOTH queues — any
+            // writeCharacteristic that was waiting on this descriptor write needs to resume
+            // (e.g. TOGGLE_REALTIME_HR queued the moment bonded=true flipped).
             cccdInFlight = false
             drainCccdQueue(g)
+            drainWriteQueue()
         }
 
         // Android 13+ delivers the value as a parameter; older APIs read it off the characteristic.
@@ -922,7 +928,14 @@ class WhoopBleClient(
 
     @SuppressLint("MissingPermission")
     private fun drainWriteQueue() {
-        if (writeInFlight) return
+        // Android serialises ALL GATT ops, not just writeCharacteristic. If a CCCD descriptor
+        // write is in flight (e.g. the post-bond drain is still running), firing a
+        // writeCharacteristic now is rejected with BUSY and the existing failure path silently
+        // drops the frame. Symptom: TOGGLE_REALTIME_HR queued by LiveScreen the instant
+        // bonded=true flips never reaches the strap, so the HR card stays at "—" while battery
+        // (delivered by the bond's own COMMAND_RESPONSE) and unsolicited EVENTs both populate.
+        // (Second half of issue #12; the cccdInFlight check waits out the drain.)
+        if (writeInFlight || cccdInFlight) return
         val g = gatt ?: return
         val ch = cmdCharacteristic ?: return
         val item = writeQueue.poll() ?: return
@@ -947,10 +960,12 @@ class WhoopBleClient(
 
         if (!ok) {
             // The stack rejected the write outright (no callback will come) — release the slot and
-            // keep draining so one bad write doesn't wedge the queue.
+            // keep draining so one bad write doesn't wedge the queue. Kick the CCCD queue too in
+            // case a descriptor write was waiting on this slot.
             writeInFlight = false
             log("writeCharacteristic rejected by stack; dropping one frame")
             drainWriteQueue()
+            drainCccdQueue(g)
             return
         }
 
@@ -960,6 +975,7 @@ class WhoopBleClient(
             handler.post {
                 writeInFlight = false
                 drainWriteQueue()
+                drainCccdQueue(g)
             }
         }
     }
@@ -1066,7 +1082,10 @@ class WhoopBleClient(
 
     @SuppressLint("MissingPermission")
     private fun drainCccdQueue(g: BluetoothGatt) {
-        if (cccdInFlight) return
+        // Symmetric to drainWriteQueue: a writeDescriptor issued during an in-flight
+        // writeCharacteristic is rejected with BUSY. Wait for the characteristic write to
+        // complete; onCharacteristicWrite re-kicks this drain after releasing the slot.
+        if (cccdInFlight || writeInFlight) return
         val ch = cccdQueue.poll()
         if (ch == null) {
             // CCCDs done — now safe to run the WHOOP4 connect handshake without its commands
@@ -1085,6 +1104,7 @@ class WhoopBleClient(
             log("No CCCD on ${ch.uuid}; skipping")
             cccdInFlight = false
             drainCccdQueue(g)
+            drainWriteQueue()
             return
         }
         val enableValue = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
@@ -1101,6 +1121,7 @@ class WhoopBleClient(
             cccdInFlight = false
             log("writeDescriptor rejected for ${ch.uuid}")
             drainCccdQueue(g)
+            drainWriteQueue()
         }
     }
 
